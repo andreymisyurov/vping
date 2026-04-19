@@ -6,13 +6,17 @@
 
 #include <linux/etherdevice.h>
 #include <linux/fs.h>
+#include <linux/icmp.h>
+#include <linux/if_arp.h>
 #include <linux/in.h>
 #include <linux/inet.h>
 #include <linux/init.h>
+#include <linux/ip.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/proc_fs.h>
+#include <linux/skbuff.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
@@ -110,6 +114,91 @@ static void vping_setup(struct net_device *dev)
 	eth_hw_addr_random(dev);
 }
 
+static int vping_arp_rcv(struct sk_buff *skb, struct net_device *dev,
+			 struct packet_type *pt, struct net_device *orig_dev)
+{
+	const struct arphdr *arp;
+	const unsigned char *p;
+	__be32 sip, tip;
+	__be32 our_ip;
+
+	our_ip = READ_ONCE(vping_ip);
+	if (!our_ip)
+		goto out;
+
+	if (!pskb_may_pull(skb, sizeof(*arp)))
+		goto out;
+	arp = arp_hdr(skb);
+
+	if (arp->ar_hrd != htons(ARPHRD_ETHER) ||
+	    arp->ar_pro != htons(ETH_P_IP) ||
+	    arp->ar_hln != ETH_ALEN ||
+	    arp->ar_pln != 4 ||
+	    arp->ar_op  != htons(ARPOP_REQUEST))
+		goto out;
+
+	if (!pskb_may_pull(skb, sizeof(*arp) + 2 * (ETH_ALEN + 4)))
+		goto out;
+	arp = arp_hdr(skb);
+	p = (const unsigned char *)(arp + 1);
+	memcpy(&sip, p + ETH_ALEN, 4);
+	memcpy(&tip, p + ETH_ALEN + 4 + ETH_ALEN, 4);
+
+	if (tip == our_ip)
+		pr_info("%s: ARP request for %pI4 from %pI4 on %s\n",
+			DRV_NAME, &tip, &sip, skb->dev->name);
+
+out:
+	consume_skb(skb);
+	return NET_RX_SUCCESS;
+}
+
+static int vping_ip_rcv(struct sk_buff *skb, struct net_device *dev,
+			struct packet_type *pt, struct net_device *orig_dev)
+{
+	const struct iphdr *iph;
+	const struct icmphdr *icmph;
+	__be32 our_ip;
+	unsigned int ihl;
+
+	our_ip = READ_ONCE(vping_ip);
+	if (!our_ip)
+		goto out;
+
+	if (!pskb_may_pull(skb, sizeof(*iph)))
+		goto out;
+	iph = ip_hdr(skb);
+
+	if (iph->daddr != our_ip || iph->protocol != IPPROTO_ICMP)
+		goto out;
+
+	ihl = iph->ihl * 4;
+	if (!pskb_may_pull(skb, ihl + sizeof(*icmph)))
+		goto out;
+	iph = ip_hdr(skb);
+	icmph = (const struct icmphdr *)((const u8 *)iph + ihl);
+
+	if (icmph->type != ICMP_ECHO)
+		goto out;
+
+	pr_info("%s: ICMP echo for %pI4 from %pI4 on %s\n",
+		DRV_NAME, &iph->daddr, &iph->saddr, skb->dev->name);
+
+out:
+	consume_skb(skb);
+	return NET_RX_SUCCESS;
+}
+
+static struct packet_type vping_arp_pt __read_mostly = {
+	.type = cpu_to_be16(ETH_P_ARP),
+	.func = vping_arp_rcv,
+};
+
+static struct packet_type vping_ip_pt __read_mostly = {
+	.type = cpu_to_be16(ETH_P_IP),
+	.func = vping_ip_rcv,
+};
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
 static const struct proc_ops vping_proc_ops = {
 	.proc_read  = vping_proc_read,
@@ -146,6 +235,9 @@ static int __init vping_init(void)
 		goto err_free;
 	}
 
+	dev_add_pack(&vping_arp_pt);
+	dev_add_pack(&vping_ip_pt);
+
 	pr_info("%s: loaded, /proc/%s and %s ready\n",
 		DRV_NAME, DRV_NAME, vping_dev->name);
 	return 0;
@@ -160,6 +252,8 @@ err_proc:
 
 static void __exit vping_exit(void)
 {
+	dev_remove_pack(&vping_ip_pt);
+	dev_remove_pack(&vping_arp_pt);
 	unregister_netdev(vping_dev);
 	free_netdev(vping_dev);
 	proc_remove(vping_proc);
@@ -172,4 +266,4 @@ module_exit(vping_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Andrey Misyurov <andrey.misyurov@gmail.com>");
 MODULE_DESCRIPTION("vping: virtual netdev with IPv4 configured via /proc/vping");
-MODULE_VERSION("0.3.0");
+MODULE_VERSION("0.4.0");

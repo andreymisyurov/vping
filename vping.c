@@ -20,6 +20,7 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <net/arp.h>
 
 #define DRV_NAME "vping"
 
@@ -114,11 +115,33 @@ static void vping_setup(struct net_device *dev)
 	eth_hw_addr_random(dev);
 }
 
+static void vping_send_arp_reply(struct sk_buff *req, __be32 our_ip,
+				 __be32 sender_ip, const unsigned char *sender_hw)
+{
+	struct net_device *dev = req->dev;
+	struct sk_buff *reply;
+
+	reply = arp_create(ARPOP_REPLY, ETH_P_ARP,
+			   sender_ip,        /* target IP    (requester's IP)  */
+			   dev,              /* egress device                  */
+			   our_ip,           /* sender IP    (our IP)          */
+			   sender_hw,        /* dest HW      (requester's MAC) */
+			   dev->dev_addr,    /* sender HW    (NIC's own MAC)   */
+			   sender_hw);       /* target HW    (requester's MAC) */
+	if (!reply) {
+		pr_warn("%s: arp_create failed\n", DRV_NAME);
+		return;
+	}
+
+	dev_queue_xmit(reply);
+}
+
 static int vping_arp_rcv(struct sk_buff *skb, struct net_device *dev,
 			 struct packet_type *pt, struct net_device *orig_dev)
 {
 	const struct arphdr *arp;
 	const unsigned char *p;
+	unsigned char sha[ETH_ALEN];
 	__be32 sip, tip;
 	__be32 our_ip;
 
@@ -141,12 +164,16 @@ static int vping_arp_rcv(struct sk_buff *skb, struct net_device *dev,
 		goto out;
 	arp = arp_hdr(skb);
 	p = (const unsigned char *)(arp + 1);
+	memcpy(sha, p, ETH_ALEN);
 	memcpy(&sip, p + ETH_ALEN, 4);
 	memcpy(&tip, p + ETH_ALEN + 4 + ETH_ALEN, 4);
 
-	if (tip == our_ip)
-		pr_info("%s: ARP request for %pI4 from %pI4 on %s\n",
-			DRV_NAME, &tip, &sip, skb->dev->name);
+	if (tip != our_ip)
+		goto out;
+
+	pr_info("%s: ARP reply for %pI4 -> %pM, to %pI4 on %s\n",
+		DRV_NAME, &tip, skb->dev->dev_addr, &sip, skb->dev->name);
+	vping_send_arp_reply(skb, our_ip, sip, sha);
 
 out:
 	consume_skb(skb);
@@ -266,4 +293,4 @@ module_exit(vping_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Andrey Misyurov <andrey.misyurov@gmail.com>");
 MODULE_DESCRIPTION("vping: virtual netdev with IPv4 configured via /proc/vping");
-MODULE_VERSION("0.4.0");
+MODULE_VERSION("0.5.0");
